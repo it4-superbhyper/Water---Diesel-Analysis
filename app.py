@@ -7,9 +7,27 @@ import numpy as np
 from fpdf import FPDF
 import tempfile
 import os
+import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from scipy import stats
+from scipy.stats import pearsonr, spearmanr
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import DBSCAN
+import warnings
+warnings.filterwarnings('ignore')
 
 st.set_page_config(page_title="Water & Diesel Usage Comparison", layout="wide")
-st.title("📊 Water & Diesel Usage Analytics Comparison")
+st.title("📊 Advanced Water & Diesel Usage Analytics")
+
+# Sidebar for analysis options
+st.sidebar.header("🔧 Analysis Options")
+show_advanced = st.sidebar.checkbox("Show Advanced Analytics", value=True)
+show_forecasting = st.sidebar.checkbox("Show Forecasting", value=True)
+show_anomalies = st.sidebar.checkbox("Show Anomaly Detection", value=True)
+show_correlations = st.sidebar.checkbox("Show Correlation Analysis", value=True)
 
 uploaded_file = st.file_uploader("Upload WATER.DIESEL PDF", type="pdf")
 
@@ -32,7 +50,7 @@ def parse_usage_data(text):
     for match in pattern.finditer(text):
         month, year = match.group(1), f"20{match.group(2)}"
         data.append({
-            "Month": month,
+            "Month": match.group(1),
             "Year": int(year),
             "Water Used (L)": int(match.group(5)),
             "Diesel Used (L)": int(match.group(8)),
@@ -41,6 +59,187 @@ def parse_usage_data(text):
             "Generator Cost (R)": float(match.group(13)),
         })
     return pd.DataFrame(data)
+
+def calculate_efficiency_metrics(df):
+    """Calculate efficiency and ratio metrics"""
+    metrics_df = df.copy()
+    
+    # Cost per liter calculations
+    metrics_df['Diesel Cost per L'] = metrics_df['Diesel Cost (R)'] / metrics_df['Diesel Used (L)']
+    metrics_df['Generator Cost per L'] = metrics_df['Generator Cost (R)'] / metrics_df['Generator Used (L)']
+    
+    # Usage ratios
+    metrics_df['Water to Diesel Ratio'] = metrics_df['Water Used (L)'] / metrics_df['Diesel Used (L)']
+    metrics_df['Generator to Diesel Ratio'] = metrics_df['Generator Used (L)'] / metrics_df['Diesel Used (L)']
+    
+    # Total costs and usage
+    metrics_df['Total Fuel Cost (R)'] = metrics_df['Diesel Cost (R)'] + metrics_df['Generator Cost (R)']
+    metrics_df['Total Fuel Used (L)'] = metrics_df['Diesel Used (L)'] + metrics_df['Generator Used (L)']
+    
+    # Efficiency score (lower is better)
+    metrics_df['Cost Efficiency Score'] = metrics_df['Total Fuel Cost (R)'] / metrics_df['Water Used (L)']
+    
+    return metrics_df
+
+def perform_statistical_analysis(df):
+    """Perform comprehensive statistical analysis"""
+    stats_results = {}
+    
+    numeric_cols = ['Water Used (L)', 'Diesel Used (L)', 'Diesel Cost (R)', 
+                   'Generator Used (L)', 'Generator Cost (R)']
+    
+    # Basic statistics
+    stats_results['descriptive'] = df[numeric_cols].describe()
+    
+    # Normality tests
+    normality_results = {}
+    for col in numeric_cols:
+        stat, p_value = stats.shapiro(df[col].dropna())
+        normality_results[col] = {'statistic': stat, 'p_value': p_value, 'is_normal': p_value > 0.05}
+    stats_results['normality'] = normality_results
+    
+    # Year-over-year comparison using t-test
+    if len(df['Year'].unique()) >= 2:
+        comparison_results = {}
+        for col in numeric_cols:
+            years = sorted(df['Year'].unique())
+            if len(years) >= 2:
+                data_year1 = df[df['Year'] == years[0]][col].dropna()
+                data_year2 = df[df['Year'] == years[1]][col].dropna()
+                if len(data_year1) > 0 and len(data_year2) > 0:
+                    stat, p_value = stats.ttest_ind(data_year1, data_year2)
+                    comparison_results[col] = {
+                        'statistic': stat, 
+                        'p_value': p_value, 
+                        'significant_change': p_value < 0.05,
+                        'year1_mean': data_year1.mean(),
+                        'year2_mean': data_year2.mean()
+                    }
+        stats_results['year_comparison'] = comparison_results
+    
+    return stats_results
+
+def calculate_correlations(df):
+    """Calculate correlation matrix for usage metrics"""
+    numeric_cols = ['Water Used (L)', 'Diesel Used (L)', 'Diesel Cost (R)', 
+                   'Generator Used (L)', 'Generator Cost (R)']
+    
+    correlation_matrix = df[numeric_cols].corr()
+    
+    # Calculate p-values for correlations
+    p_values = np.zeros((len(numeric_cols), len(numeric_cols)))
+    for i, col1 in enumerate(numeric_cols):
+        for j, col2 in enumerate(numeric_cols):
+            if i != j:
+                _, p_val = pearsonr(df[col1].dropna(), df[col2].dropna())
+                p_values[i, j] = p_val
+            else:
+                p_values[i, j] = 0
+    
+    return correlation_matrix, p_values
+
+def detect_anomalies(df):
+    """Detect anomalies using statistical methods"""
+    numeric_cols = ['Water Used (L)', 'Diesel Used (L)', 'Generator Used (L)']
+    anomalies = {}
+    
+    for col in numeric_cols:
+        data = df[col].values.reshape(-1, 1)
+        
+        # Z-score method
+        z_scores = np.abs(stats.zscore(df[col]))
+        z_anomalies = df[z_scores > 2.5].index.tolist()
+        
+        # IQR method
+        Q1 = df[col].quantile(0.25)
+        Q3 = df[col].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        iqr_anomalies = df[(df[col] < lower_bound) | (df[col] > upper_bound)].index.tolist()
+        
+        anomalies[col] = {
+            'z_score_anomalies': z_anomalies,
+            'iqr_anomalies': iqr_anomalies,
+            'combined_anomalies': list(set(z_anomalies + iqr_anomalies))
+        }
+    
+    return anomalies
+
+def simple_forecast(df, periods=3):
+    """Simple linear regression forecast"""
+    forecasts = {}
+    numeric_cols = ['Water Used (L)', 'Diesel Used (L)', 'Generator Used (L)']
+    
+    # Create time index
+    df_sorted = df.sort_values(['Year', 'Month'])
+    df_sorted['time_index'] = range(len(df_sorted))
+    
+    for col in numeric_cols:
+        if len(df_sorted) >= 3:  # Need at least 3 points for meaningful forecast
+            X = df_sorted['time_index'].values.reshape(-1, 1)
+            y = df_sorted[col].values
+            
+            model = LinearRegression()
+            model.fit(X, y)
+            
+            # Forecast future periods
+            future_indices = np.arange(len(df_sorted), len(df_sorted) + periods).reshape(-1, 1)
+            forecast_values = model.predict(future_indices)
+            
+            # Calculate R² score
+            r2_score = model.score(X, y)
+            
+            forecasts[col] = {
+                'values': forecast_values,
+                'r2_score': r2_score,
+                'trend': 'increasing' if model.coef_[0] > 0 else 'decreasing'
+            }
+    
+    return forecasts
+
+def create_interactive_charts(df):
+    """Create interactive Plotly charts"""
+    charts = {}
+    
+    # Time series chart
+    fig_ts = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=('Water Usage', 'Diesel Usage', 'Generator Usage', 'Costs'),
+        specs=[[{"secondary_y": False}, {"secondary_y": False}],
+               [{"secondary_y": False}, {"secondary_y": True}]]
+    )
+    
+    # Add traces for different metrics
+    df_sorted = df.sort_values(['Year', 'Month'])
+    x_labels = [f"{row['Month']} {row['Year']}" for _, row in df_sorted.iterrows()]
+    
+    fig_ts.add_trace(go.Scatter(x=x_labels, y=df_sorted['Water Used (L)'], 
+                               name='Water (L)', line=dict(color='blue')), row=1, col=1)
+    fig_ts.add_trace(go.Scatter(x=x_labels, y=df_sorted['Diesel Used (L)'], 
+                               name='Diesel (L)', line=dict(color='red')), row=1, col=2)
+    fig_ts.add_trace(go.Scatter(x=x_labels, y=df_sorted['Generator Used (L)'], 
+                               name='Generator (L)', line=dict(color='green')), row=2, col=1)
+    fig_ts.add_trace(go.Scatter(x=x_labels, y=df_sorted['Diesel Cost (R)'], 
+                               name='Diesel Cost', line=dict(color='orange')), row=2, col=2)
+    fig_ts.add_trace(go.Scatter(x=x_labels, y=df_sorted['Generator Cost (R)'], 
+                               name='Generator Cost', line=dict(color='purple')), row=2, col=2)
+    
+    fig_ts.update_layout(height=600, title_text="Usage and Cost Trends Over Time")
+    charts['time_series'] = fig_ts
+    
+    # Efficiency scatter plot
+    metrics_df = calculate_efficiency_metrics(df)
+    fig_efficiency = px.scatter(metrics_df, 
+                               x='Water Used (L)', 
+                               y='Total Fuel Cost (R)',
+                               size='Total Fuel Used (L)',
+                               color='Year',
+                               hover_data=['Month', 'Cost Efficiency Score'],
+                               title='Water Usage vs Total Fuel Cost (Size = Total Fuel Used)')
+    charts['efficiency'] = fig_efficiency
+    
+    return charts
 
 def calculate_summary_table(df):
     metrics = ["Water Used (L)", "Diesel Used (L)", "Diesel Cost (R)",
@@ -74,7 +273,7 @@ def plot_metric_with_trend(df, metric):
     fig, ax = plt.subplots(figsize=(8, 4))
     bars = df[metric].plot(kind="bar", ax=ax)
 
-    # ✅ Add value labels to each bar
+    # Add value labels to each bar
     for container in bars.containers:
         bars.bar_label(container, fmt="%.0f", padding=3, fontsize=8)
 
@@ -89,6 +288,42 @@ def plot_metric_with_trend(df, metric):
     ax.legend(title="Year")
     plt.tight_layout()
     return fig
+
+def generate_advanced_insights(df, stats_results, anomalies, forecasts):
+    """Generate advanced insights and recommendations"""
+    insights = []
+    
+    # Efficiency insights
+    metrics_df = calculate_efficiency_metrics(df)
+    avg_efficiency = metrics_df['Cost Efficiency Score'].mean()
+    best_efficiency_month = metrics_df.loc[metrics_df['Cost Efficiency Score'].idxmin()]
+    
+    insights.append(f"💡 **Efficiency Analysis**: Average cost efficiency is R{avg_efficiency:.2f} per liter of water. "
+                   f"Best efficiency was in {best_efficiency_month['Month']} {best_efficiency_month['Year']} "
+                   f"(R{best_efficiency_month['Cost Efficiency Score']:.2f}/L).")
+    
+    # Trend insights
+    for col, forecast in forecasts.items():
+        trend_direction = forecast['trend']
+        confidence = "high" if forecast['r2_score'] > 0.7 else "moderate" if forecast['r2_score'] > 0.4 else "low"
+        insights.append(f"📈 **{col} Forecast**: {trend_direction.title()} trend with {confidence} confidence "
+                       f"(R² = {forecast['r2_score']:.3f}). Next 3 months predicted: "
+                       f"{', '.join([f'{v:.0f}L' for v in forecast['values']])}")
+    
+    # Anomaly insights
+    total_anomalies = sum(len(anomaly_info['combined_anomalies']) for anomaly_info in anomalies.values())
+    if total_anomalies > 0:
+        insights.append(f"⚠️ **Anomaly Detection**: Found {total_anomalies} anomalous usage patterns that may need investigation.")
+    
+    # Statistical significance insights
+    if 'year_comparison' in stats_results:
+        significant_changes = [col for col, result in stats_results['year_comparison'].items() 
+                             if result['significant_change']]
+        if significant_changes:
+            insights.append(f"📊 **Statistical Significance**: Significant year-over-year changes detected in: "
+                           f"{', '.join(significant_changes)}")
+    
+    return insights
 
 def generate_pdf_report(figures, summary_df, summary_text):
     pdf = FPDF()
@@ -163,36 +398,186 @@ if uploaded_file:
             options=available_months,
             default=available_months
         )
-        df = df[df["Month"].isin(selected_months)]
+        df_filtered = df[df["Month"].isin(selected_months)]
 
-        if df.empty:
+        if df_filtered.empty:
             st.warning("No data available for selected month(s).")
         else:
-            pivot_df = df.pivot(index="Month", columns="Year", values=[
-                "Water Used (L)", "Diesel Used (L)", "Diesel Cost (R)",
-                "Generator Used (L)", "Generator Cost (R)"
-            ])
-            pivot_df = pivot_df.reindex(selected_months)
+            # Calculate enhanced metrics
+            metrics_df = calculate_efficiency_metrics(df_filtered)
+            
+            # Create tabs for different analysis sections
+            tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "📈 Advanced Analytics", "🔍 Statistical Analysis", "🎯 Insights", "📋 Raw Data"])
+            
+            with tab1:
+                st.subheader("📈 Interactive Visualizations")
+                
+                # Create interactive charts
+                charts = create_interactive_charts(df_filtered)
+                st.plotly_chart(charts['time_series'], use_container_width=True)
+                st.plotly_chart(charts['efficiency'], use_container_width=True)
+                
+                # Traditional matplotlib charts
+                pivot_df = df_filtered.pivot(index="Month", columns="Year", values=[
+                    "Water Used (L)", "Diesel Used (L)", "Diesel Cost (R)",
+                    "Generator Used (L)", "Generator Cost (R)"
+                ])
+                pivot_df = pivot_df.reindex(selected_months)
 
-            st.subheader("📈 Trend Graphs with Values")
-            figures = []
-            for metric in pivot_df.columns.levels[0]:
-                fig = plot_metric_with_trend(pivot_df, metric)
-                st.pyplot(fig)
-                figures.append((metric, fig))
-
-            st.subheader("📋 Raw Data Table")
-            st.dataframe(df)
-
-            summary_df = calculate_summary_table(df)
-            summary_text = generate_summary_paragraph(summary_df)
-
-            st.subheader("📑 Auto Summary")
-            st.text(summary_text)
-            st.dataframe(summary_df)
-
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button("📥 Download CSV", csv, file_name="water_diesel_data.csv")
-
-            pdf = generate_pdf_report(figures, summary_df, summary_text)
-            st.download_button("📄 Download PDF Report", data=pdf, file_name="water_diesel_report.pdf", mime="application/pdf")
+                st.subheader("📈 Trend Graphs with Values")
+                figures = []
+                for metric in pivot_df.columns.levels[0]:
+                    fig = plot_metric_with_trend(pivot_df, metric)
+                    st.pyplot(fig)
+                    figures.append((metric, fig))
+            
+            with tab2:
+                if show_advanced:
+                    st.subheader("⚡ Efficiency Metrics")
+                    
+                    # Display efficiency metrics
+                    efficiency_cols = ['Month', 'Year', 'Cost Efficiency Score', 'Water to Diesel Ratio', 
+                                     'Generator to Diesel Ratio', 'Total Fuel Cost (R)', 'Total Fuel Used (L)']
+                    st.dataframe(metrics_df[efficiency_cols])
+                    
+                    # Efficiency trends
+                    fig_eff = px.line(metrics_df, x='Month', y='Cost Efficiency Score', color='Year',
+                                     title='Cost Efficiency Trend (Lower is Better)')
+                    st.plotly_chart(fig_eff, use_container_width=True)
+                    
+                if show_forecasting:
+                    st.subheader("🔮 Usage Forecasting")
+                    forecasts = simple_forecast(df_filtered)
+                    
+                    forecast_cols = st.columns(3)
+                    for i, (metric, forecast) in enumerate(forecasts.items()):
+                        with forecast_cols[i % 3]:
+                            st.metric(
+                                f"{metric} Trend",
+                                f"{forecast['trend'].title()}",
+                                f"R² = {forecast['r2_score']:.3f}"
+                            )
+                            st.write("Next 3 periods:")
+                            for j, val in enumerate(forecast['values'], 1):
+                                st.write(f"Period {j}: {val:.0f}L")
+                
+                if show_anomalies:
+                    st.subheader("🚨 Anomaly Detection")
+                    anomalies = detect_anomalies(df_filtered)
+                    
+                    for metric, anomaly_info in anomalies.items():
+                        if anomaly_info['combined_anomalies']:
+                            st.warning(f"**{metric}**: {len(anomaly_info['combined_anomalies'])} anomalies detected at indices: {anomaly_info['combined_anomalies']}")
+                        else:
+                            st.success(f"**{metric}**: No anomalies detected")
+            
+            with tab3:
+                if show_correlations:
+                    st.subheader("🔗 Correlation Analysis")
+                    correlation_matrix, p_values = calculate_correlations(df_filtered)
+                    
+                    # Create correlation heatmap
+                    fig_corr, ax = plt.subplots(figsize=(10, 8))
+                    sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', center=0,
+                               square=True, ax=ax)
+                    ax.set_title('Correlation Matrix of Usage Metrics')
+                    st.pyplot(fig_corr)
+                    
+                    # Show strongest correlations
+                    st.subheader("🎯 Strongest Correlations")
+                    corr_pairs = []
+                    for i in range(len(correlation_matrix.columns)):
+                        for j in range(i+1, len(correlation_matrix.columns)):
+                            corr_val = correlation_matrix.iloc[i, j]
+                            if abs(corr_val) > 0.5:  # Only show strong correlations
+                                corr_pairs.append({
+                                    'Metric 1': correlation_matrix.columns[i],
+                                    'Metric 2': correlation_matrix.columns[j],
+                                    'Correlation': corr_val,
+                                    'Strength': 'Strong' if abs(corr_val) > 0.7 else 'Moderate'
+                                })
+                    
+                    if corr_pairs:
+                        st.dataframe(pd.DataFrame(corr_pairs))
+                    else:
+                        st.info("No strong correlations found (|r| > 0.5)")
+                
+                st.subheader("📊 Statistical Summary")
+                stats_results = perform_statistical_analysis(df_filtered)
+                
+                # Descriptive statistics
+                st.write("**Descriptive Statistics:**")
+                st.dataframe(stats_results['descriptive'])
+                
+                # Normality test results
+                if 'normality' in stats_results:
+                    st.write("**Normality Tests (Shapiro-Wilk):**")
+                    normality_df = pd.DataFrame.from_dict(stats_results['normality'], orient='index')
+                    st.dataframe(normality_df)
+                
+                # Year comparison results
+                if 'year_comparison' in stats_results:
+                    st.write("**Year-over-Year Statistical Comparison (T-test):**")
+                    comparison_df = pd.DataFrame.from_dict(stats_results['year_comparison'], orient='index')
+                    st.dataframe(comparison_df)
+            
+            with tab4:
+                st.subheader("🎯 Advanced Insights & Recommendations")
+                
+                # Generate insights
+                stats_results = perform_statistical_analysis(df_filtered)
+                anomalies = detect_anomalies(df_filtered)
+                forecasts = simple_forecast(df_filtered)
+                insights = generate_advanced_insights(df_filtered, stats_results, anomalies, forecasts)
+                
+                for insight in insights:
+                    st.markdown(insight)
+                
+                # Cost optimization recommendations
+                st.subheader("💰 Cost Optimization Recommendations")
+                avg_diesel_cost = df_filtered['Diesel Cost (R)'].mean()
+                avg_generator_cost = df_filtered['Generator Cost (R)'].mean()
+                
+                if avg_generator_cost > avg_diesel_cost:
+                    savings_potential = avg_generator_cost - avg_diesel_cost
+                    st.info(f"💡 **Generator Optimization**: Generator costs are R{savings_potential:.2f} higher on average than diesel costs. Consider optimizing generator usage.")
+                
+                # Seasonal patterns
+                if len(df_filtered) >= 6:  # Need sufficient data for seasonal analysis
+                    seasonal_analysis = df_filtered.groupby('Month')[['Water Used (L)', 'Diesel Used (L)', 'Generator Used (L)']].mean()
+                    peak_usage_month = seasonal_analysis.sum(axis=1).idxmax()
+                    st.info(f"📅 **Seasonal Pattern**: Peak usage typically occurs in {peak_usage_month}. Plan maintenance and procurement accordingly.")
+            
+            with tab5:
+                st.subheader("📋 Enhanced Data Tables")
+                
+                # Original summary
+                summary_df = calculate_summary_table(df_filtered)
+                summary_text = generate_summary_paragraph(summary_df)
+                
+                st.subheader("📑 Executive Summary")
+                st.text(summary_text)
+                st.dataframe(summary_df)
+                
+                # Enhanced metrics table
+                st.subheader("⚡ Efficiency & Ratio Metrics")
+                st.dataframe(metrics_df)
+                
+                # Raw data
+                st.subheader("📊 Raw Usage Data")
+                st.dataframe(df_filtered)
+                
+                # Download options
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    csv = df_filtered.to_csv(index=False).encode("utf-8")
+                    st.download_button("📥 Download CSV", csv, file_name="water_diesel_data.csv")
+                
+                with col2:
+                    enhanced_csv = metrics_df.to_csv(index=False).encode("utf-8")
+                    st.download_button("📥 Download Enhanced CSV", enhanced_csv, file_name="enhanced_water_diesel_data.csv")
+                
+                with col3:
+                    pdf = generate_pdf_report(figures, summary_df, summary_text)
+                    st.download_button("📄 Download PDF Report", data=pdf, file_name="water_diesel_report.pdf", mime="application/pdf")
