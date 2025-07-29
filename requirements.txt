@@ -4,3 +4,8 @@ PyMuPDF
 matplotlib
 numpy
 fpdf
+scipy
+seaborn
+plotly
+scikit-learn
+statsmodels
